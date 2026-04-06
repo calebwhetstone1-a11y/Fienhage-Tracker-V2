@@ -11,8 +11,8 @@ from pdf2image import convert_from_path
 from openpyxl import load_workbook
 
 
-st.set_page_config(page_title="PDF Fienhage Tracker", layout="wide")
-st.title("PDF Fienhage Tracker")
+st.set_page_config(page_title="PDF OCR Tracker Updater", layout="wide")
+st.title("PDF OCR Tracker Updater")
 
 
 # -----------------------------
