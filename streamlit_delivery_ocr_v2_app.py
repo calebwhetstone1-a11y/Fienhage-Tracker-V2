@@ -58,8 +58,7 @@ def normalize_part_number(value):
     value = value.replace("\xa0", " ")
     value = value.replace("—", "-").replace("–", "-")
     value = " ".join(value.split())
-    value = value.upper()
-    return value
+    return value.upper()
 
 
 def normalize_ocr_part_text(value):
@@ -75,11 +74,9 @@ def normalize_ocr_part_text(value):
     value = value.replace("I", "1")
     value = value.replace("L", "1")
 
-    # Remove spaces around separators
     value = re.sub(r"\s*-\s*", "-", value)
     value = re.sub(r"\s+", "", value)
 
-    # If OCR dropped dash entirely but 8 digits found, restore XXXX-XXXX
     if re.fullmatch(r"\d{8}", value):
         value = value[:4] + "-" + value[4:]
 
@@ -114,9 +111,7 @@ def merge_comma_separated(existing_value, new_value):
 
 
 def normalize_quantity_text(qty_raw):
-    qty_raw = str(qty_raw).strip()
-
-    qty_raw = qty_raw.replace(" ", "")
+    qty_raw = str(qty_raw).strip().replace(" ", "")
 
     if "," in qty_raw and "." in qty_raw:
         if qty_raw.rfind(",") > qty_raw.rfind("."):
@@ -161,17 +156,8 @@ def extract_document_number(text):
 def is_table_header(line):
     line_lower = line.lower()
 
-    item_words = [
-        "item",
-        "artikelnr",
-        "artikelnr.",
-    ]
-
-    desc_words = [
-        "descr",
-        "beschr",
-        "beschr.",
-    ]
+    item_words = ["item", "artikelnr", "artikelnr."]
+    desc_words = ["descr", "beschr", "beschr."]
 
     has_item = any(word in line_lower for word in item_words)
     has_desc = any(word in line_lower for word in desc_words)
@@ -181,13 +167,7 @@ def is_table_header(line):
 
 def is_end_of_table(line):
     line_lower = line.lower().strip()
-
-    end_words = [
-        "total colli",
-        "anzahl colli",
-        "anzahl colli:",
-    ]
-
+    end_words = ["total colli", "anzahl colli", "anzahl colli:"]
     return any(word in line_lower for word in end_words)
 
 
@@ -205,60 +185,27 @@ def extract_colli_number(line):
     return ""
 
 
-def preprocess_base(img):
+def preprocess_for_ocr(img):
     img = ImageOps.exif_transpose(img)
     img = img.convert("L")
     img = ImageOps.autocontrast(img)
 
-    # Upscale helps small text a lot
     w, h = img.size
     img = img.resize((w * 2, h * 2))
 
-    # Gentle cleanup
     img = img.filter(ImageFilter.MedianFilter(size=3))
     img = img.filter(ImageFilter.SHARPEN)
 
     return img
 
 
-def build_ocr_variants(img):
-    base = preprocess_base(img)
-
-    variants = []
-
-    # Variant 1: grayscale base
-    variants.append(("gray", base))
-
-    # Variant 2: lighter threshold
-    bw_170 = base.point(lambda p: 255 if p > 170 else 0)
-    variants.append(("bw170", bw_170))
-
-    # Variant 3: slightly darker threshold
-    bw_150 = base.point(lambda p: 255 if p > 150 else 0)
-    variants.append(("bw150", bw_150))
-
-    return variants
-
-
-def run_ocr_on_variants(img):
-    ocr_outputs = []
-
-    variants = build_ocr_variants(img)
-
-    for variant_name, variant_img in variants:
-        for psm in [6, 11]:
-            config = f"--oem 3 --psm {psm} -c preserve_interword_spaces=1"
-            text = pytesseract.image_to_string(variant_img, config=config)
-            ocr_outputs.append(
-                {
-                    "variant": variant_name,
-                    "psm": psm,
-                    "image": variant_img,
-                    "text": text,
-                }
-            )
-
-    return ocr_outputs
+def run_ocr(img):
+    processed_img = preprocess_for_ocr(img)
+    text = pytesseract.image_to_string(
+        processed_img,
+        config="--oem 3 --psm 6 -c preserve_interword_spaces=1"
+    )
+    return processed_img, text
 
 
 def line_looks_like_item_row(line):
@@ -266,25 +213,17 @@ def line_looks_like_item_row(line):
     patterns = [
         r"\b\d{4}\s*-\s*\d{4}\b",
         r"\b\d{4}\s+\d{4}\b",
-        r"\b\d{4}[O0IL]\s*-\s*\d{4}\b",
+        r"\b\d{8}\b",
     ]
     return any(re.search(pattern, line, re.IGNORECASE) for pattern in patterns)
 
 
 def extract_item_and_remainder(line):
-    """
-    More forgiving item-number extraction:
-    - allows -, en dash, em dash
-    - allows space in place of dash
-    - allows OCR confusion like O/0, I/1, L/1
-    """
     cleaned = line.replace("—", "-").replace("–", "-")
 
     patterns = [
         r"(\d{4}\s*-\s*\d{4})",
         r"(\d{4}\s+\d{4})",
-        r"(\d{4}[O0IL]\s*-\s*\d{4})",
-        r"(\d{4}\s*-\s*\d{3}[O0IL])",
         r"(\d{8})",
     ]
 
@@ -293,10 +232,6 @@ def extract_item_and_remainder(line):
         if m:
             raw_item = m.group(1)
             item_no = normalize_ocr_part_text(raw_item)
-
-            if re.fullmatch(r"\d{8}", item_no):
-                item_no = item_no[:4] + "-" + item_no[4:]
-
             remainder = cleaned[m.end():].strip()
             return item_no, remainder
 
@@ -304,13 +239,8 @@ def extract_item_and_remainder(line):
 
 
 def parse_quantity_and_description(remainder):
-    """
-    Tries increasingly forgiving patterns.
-    """
-
     remainder = " ".join(str(remainder).split())
 
-    # Known units
     qty_match = re.search(
         r"(.+?)\s+([\d.,]+)\s+(piece|stück|pcs?|bundle|kg|pc|roll|rolle|set|sets|meter|metre|each|einh\.?|stk|stck|m)\b",
         remainder,
@@ -326,7 +256,6 @@ def parse_quantity_and_description(remainder):
         except Exception:
             pass
 
-    # Number near end
     fallback_match = re.search(
         r"(.+?)\s+([\d.,]+)(?:\s+\S+)?$",
         remainder,
@@ -335,14 +264,12 @@ def parse_quantity_and_description(remainder):
     if fallback_match:
         description = fallback_match.group(1).strip(" -.;:")
         qty_raw = fallback_match.group(2).strip()
-        unit = "auto"
         try:
             quantity = normalize_quantity_text(qty_raw)
-            return description, quantity, unit
+            return description, quantity, "auto"
         except Exception:
             pass
 
-    # Search all numbers and use last plausible large number
     candidates = re.findall(r"[\d.,]+", remainder)
     if candidates:
         for qty_raw in reversed(candidates):
@@ -358,17 +285,6 @@ def parse_quantity_and_description(remainder):
     return None, None, None
 
 
-def dedupe_key(item_no, quantity, source_file, page_number, document_number, colli_no):
-    return (
-        str(item_no).strip(),
-        str(quantity).strip(),
-        str(source_file).strip(),
-        str(page_number).strip(),
-        str(document_number).strip(),
-        str(colli_no).strip(),
-    )
-
-
 # -----------------------------
 # File Loading
 # -----------------------------
@@ -381,7 +297,7 @@ def load_pages_from_upload(uploaded_file):
             tmp_path = tmp.name
 
         try:
-            pages = convert_from_path(tmp_path, dpi=300)
+            pages = convert_from_path(tmp_path, dpi=250)
             return [page.convert("RGB") for page in pages]
         finally:
             if os.path.exists(tmp_path):
@@ -432,12 +348,9 @@ def build_tracker_lookup(wb):
                     {
                         "sheet": ws,
                         "row": row,
-                        "headers": headers,
-                        "item_col": item_col,
                         "qty_col": qty_col,
                         "pallet_col": pallet_col,
                         "container_col": container_col,
-                        "original_item": item_value,
                     }
                 )
 
@@ -454,14 +367,11 @@ def recover_part_from_tracker(item_no, known_tracker_parts):
         return item_no
 
     compact = item_no.replace("-", "")
-
-    # Exact compact-digit match against known tracker items
     for known in known_tracker_parts:
         if known.replace("-", "") == compact:
             return known
 
-    # Fuzzy match only if very close
-    matches = get_close_matches(item_no, known_tracker_parts, n=1, cutoff=0.88)
+    matches = get_close_matches(item_no, known_tracker_parts, n=1, cutoff=0.90)
     if matches:
         return matches[0]
 
@@ -479,7 +389,6 @@ def process_delivery_files(delivery_files, known_tracker_parts):
 
     progress = st.progress(0, text="Starting OCR processing...")
     total_files = len(delivery_files)
-    seen_rows = set()
 
     for file_index, uploaded_file in enumerate(delivery_files, start=1):
         progress.progress(
@@ -491,145 +400,106 @@ def process_delivery_files(delivery_files, known_tracker_parts):
         table_started_in_previous_page = False
 
         for page_index, page_img in enumerate(pages, start=1):
-            ocr_outputs = run_ocr_on_variants(page_img)
+            processed_img, text = run_ocr(page_img)
+            preview_images.append((f"{uploaded_file.name} - Page {page_index}", processed_img))
 
-            # Preview only one processed image per page
-            if ocr_outputs:
-                preview_images.append((f"{uploaded_file.name} - Page {page_index}", ocr_outputs[0]["image"]))
+            ocr_text_records.append(
+                {
+                    "SourceFile": uploaded_file.name,
+                    "PageNumber": page_index,
+                    "OCR_Text": text,
+                }
+            )
 
-            page_best_item_count = 0
-            page_had_table = table_started_in_previous_page
+            document_number = extract_document_number(text)
+            lines = text.split("\n")
+            capture = table_started_in_previous_page
+            current_colli = ""
+            page_item_count = 0
 
-            for ocr_output in ocr_outputs:
-                text = ocr_output["text"]
-                variant_name = ocr_output["variant"]
-                psm = ocr_output["psm"]
+            for line_no, line in enumerate(lines, start=1):
+                original_line = line
+                line = " ".join(str(line).split())
 
-                ocr_text_records.append(
-                    {
-                        "SourceFile": uploaded_file.name,
-                        "PageNumber": page_index,
-                        "Variant": variant_name,
-                        "PSM": psm,
-                        "OCR_Text": text,
-                    }
-                )
+                if not line:
+                    continue
 
-                document_number = extract_document_number(text)
-                lines = text.split("\n")
-                capture = page_had_table
-                current_colli = ""
-                parsed_this_pass = 0
+                detected_colli = extract_colli_number(line)
+                if detected_colli:
+                    current_colli = detected_colli
 
-                for line_no, line in enumerate(lines, start=1):
-                    original_line = line
-                    line = " ".join(str(line).split())
+                if is_table_header(line):
+                    capture = True
+                    continue
 
-                    if not line:
-                        continue
+                if not capture and line_looks_like_item_row(line):
+                    capture = True
 
-                    detected_colli = extract_colli_number(line)
-                    if detected_colli:
-                        current_colli = detected_colli
+                if not capture:
+                    continue
 
-                    if is_table_header(line):
-                        capture = True
-                        continue
+                if is_end_of_table(line):
+                    capture = False
+                    continue
 
-                    if not capture and line_looks_like_item_row(line):
-                        capture = True
+                line = re.split(
+                    r"(total\s+colli|anzahl\s+colli\s*:?)",
+                    line,
+                    flags=re.IGNORECASE
+                )[0].strip()
 
-                    if not capture:
-                        continue
+                if not line:
+                    continue
 
-                    if is_end_of_table(line):
-                        capture = False
-                        continue
-
-                    line = re.split(
-                        r"(total\s+colli|anzahl\s+colli\s*:?)",
-                        line,
-                        flags=re.IGNORECASE
-                    )[0].strip()
-
-                    if not line:
-                        continue
-
-                    item_no, remainder = extract_item_and_remainder(line)
-
-                    if not item_no:
-                        if re.search(r"\d{4}", line):
-                            skipped_line_records.append(
-                                {
-                                    "SourceFile": uploaded_file.name,
-                                    "PageNumber": page_index,
-                                    "Variant": variant_name,
-                                    "PSM": psm,
-                                    "LineNumber": line_no,
-                                    "Reason": "No item match",
-                                    "Line": original_line,
-                                    "CleanedLine": line,
-                                }
-                            )
-                        continue
-
-                    item_no = recover_part_from_tracker(item_no, known_tracker_parts)
-
-                    description, quantity, unit = parse_quantity_and_description(remainder)
-
-                    if quantity is None or description is None:
+                item_no, remainder = extract_item_and_remainder(line)
+                if not item_no:
+                    if re.search(r"\d{4}", line):
                         skipped_line_records.append(
                             {
                                 "SourceFile": uploaded_file.name,
                                 "PageNumber": page_index,
-                                "Variant": variant_name,
-                                "PSM": psm,
                                 "LineNumber": line_no,
-                                "Reason": "No quantity/description parse",
+                                "Reason": "No item match",
                                 "Line": original_line,
                                 "CleanedLine": line,
-                                "ItemNoGuess": item_no,
-                                "Remainder": remainder,
                             }
                         )
-                        continue
+                    continue
 
-                    row_key = dedupe_key(
-                        item_no=item_no,
-                        quantity=quantity,
-                        source_file=uploaded_file.name,
-                        page_number=page_index,
-                        document_number=document_number,
-                        colli_no=current_colli,
-                    )
+                item_no = recover_part_from_tracker(item_no, known_tracker_parts)
 
-                    if row_key in seen_rows:
-                        continue
-
-                    seen_rows.add(row_key)
-
-                    all_items.append(
+                description, quantity, unit = parse_quantity_and_description(remainder)
+                if quantity is None or description is None:
+                    skipped_line_records.append(
                         {
-                            "ItemNo": item_no,
-                            "Description": description,
-                            "Quantity": quantity,
-                            "Unit": unit,
-                            "ColliNo": current_colli,
-                            "DocumentNumber": document_number,
                             "SourceFile": uploaded_file.name,
                             "PageNumber": page_index,
-                            "OCRVariant": variant_name,
-                            "PSM": psm,
+                            "LineNumber": line_no,
+                            "Reason": "No quantity/description parse",
+                            "Line": original_line,
+                            "CleanedLine": line,
+                            "ItemNoGuess": item_no,
+                            "Remainder": remainder,
                         }
                     )
+                    continue
 
-                    parsed_this_pass += 1
+                all_items.append(
+                    {
+                        "ItemNo": item_no,
+                        "Description": description,
+                        "Quantity": quantity,
+                        "Unit": unit,
+                        "ColliNo": current_colli,
+                        "DocumentNumber": document_number,
+                        "SourceFile": uploaded_file.name,
+                        "PageNumber": page_index,
+                    }
+                )
 
-                page_best_item_count = max(page_best_item_count, parsed_this_pass)
-                if parsed_this_pass > 0:
-                    page_had_table = True
+                page_item_count += 1
 
-            table_started_in_previous_page = page_best_item_count > 0
+            table_started_in_previous_page = page_item_count > 0
 
     progress.progress(100, text="OCR processing complete.")
 
@@ -666,22 +536,16 @@ def update_tracker_workbook(wb, summary_df, raw_df):
     not_found = []
 
     for _, row in summary_df.iterrows():
-        raw_item_no = row["ItemNo"]
-        item_no = normalize_part_number(raw_item_no)
-        item_no = recover_part_from_tracker(item_no, known_tracker_parts)
-
+        item_no = recover_part_from_tracker(normalize_part_number(row["ItemNo"]), known_tracker_parts)
         qty = row["Quantity"]
         desc = row["Description"]
         pallet_list = row["PalletList"]
         document_list = row["DocumentList"]
 
         if item_no in tracker_rows:
-            entries = tracker_rows[item_no]
-
-            for entry in entries:
+            for entry in tracker_rows[item_no]:
                 ws = entry["sheet"]
                 excel_row = entry["row"]
-
                 qty_col = entry["qty_col"]
                 pallet_col = entry["pallet_col"]
                 container_col = entry["container_col"]
@@ -690,13 +554,11 @@ def update_tracker_workbook(wb, summary_df, raw_df):
 
                 if pallet_col is not None:
                     existing_pallets = ws.cell(row=excel_row, column=pallet_col).value
-                    merged_pallets = merge_comma_separated(existing_pallets, pallet_list)
-                    ws.cell(row=excel_row, column=pallet_col).value = merged_pallets
+                    ws.cell(row=excel_row, column=pallet_col).value = merge_comma_separated(existing_pallets, pallet_list)
 
                 if container_col is not None:
                     existing_containers = ws.cell(row=excel_row, column=container_col).value
-                    merged_containers = merge_comma_separated(existing_containers, document_list)
-                    ws.cell(row=excel_row, column=container_col).value = merged_containers
+                    ws.cell(row=excel_row, column=container_col).value = merge_comma_separated(existing_containers, document_list)
 
                 matched.append(
                     {
@@ -722,37 +584,20 @@ def update_tracker_workbook(wb, summary_df, raw_df):
 
     unmatched_rows = []
 
-    item_column = "Item #" if "Item #" in raw_df.columns else "ItemNo" if "ItemNo" in raw_df.columns else None
-    if item_column is None:
-        raise ValueError(f"Could not find item column in raw_df. Columns found: {list(raw_df.columns)}")
-
     for _, row in raw_df.iterrows():
-        raw_item_no = row[item_column]
-        item_no = normalize_part_number(raw_item_no)
-        item_no = recover_part_from_tracker(item_no, known_tracker_parts)
-
-        desc = row["Description"] if "Description" in raw_df.columns else ""
-        qty = row["Quantity"] if "Quantity" in raw_df.columns else ""
-        source_file = row["SourceFile"] if "SourceFile" in raw_df.columns else ""
-        page_number = row["PageNumber"] if "PageNumber" in raw_df.columns else ""
-        colli_no = row["ColliNo"] if "ColliNo" in raw_df.columns else ""
-        document_number = row["DocumentNumber"] if "DocumentNumber" in raw_df.columns else ""
-        ocr_variant = row["OCRVariant"] if "OCRVariant" in raw_df.columns else ""
-        psm = row["PSM"] if "PSM" in raw_df.columns else ""
+        item_no = recover_part_from_tracker(normalize_part_number(row["ItemNo"]), known_tracker_parts)
 
         if item_no not in tracker_rows:
             unmatched_rows.append(
                 {
-                    "Item #": raw_item_no,
+                    "Item #": row["ItemNo"],
                     "Normalized Item #": item_no,
-                    "Description": desc,
-                    "Quantity": qty,
-                    "ColliNo": colli_no,
-                    "DocumentNumber": document_number,
-                    "SourceFile": source_file,
-                    "PageNumber": page_number,
-                    "OCRVariant": ocr_variant,
-                    "PSM": psm,
+                    "Description": row.get("Description", ""),
+                    "Quantity": row.get("Quantity", ""),
+                    "ColliNo": row.get("ColliNo", ""),
+                    "DocumentNumber": row.get("DocumentNumber", ""),
+                    "SourceFile": row.get("SourceFile", ""),
+                    "PageNumber": row.get("PageNumber", ""),
                 }
             )
 
@@ -761,17 +606,7 @@ def update_tracker_workbook(wb, summary_df, raw_df):
     if not unmatched_df.empty:
         unmatched_df = (
             unmatched_df.groupby(
-                [
-                    "Item #",
-                    "Normalized Item #",
-                    "Description",
-                    "ColliNo",
-                    "DocumentNumber",
-                    "SourceFile",
-                    "PageNumber",
-                    "OCRVariant",
-                    "PSM",
-                ],
+                ["Item #", "Normalized Item #", "Description", "ColliNo", "DocumentNumber", "SourceFile", "PageNumber"],
                 as_index=False,
             )["Quantity"].sum()
         )
@@ -847,7 +682,6 @@ if process_clicked:
         tracker_bytes = tracker_file.getvalue()
         wb = load_workbook(BytesIO(tracker_bytes))
 
-        # Build known part numbers before OCR so OCR can recover bad part reads
         _, known_tracker_parts = build_tracker_lookup(wb)
 
         raw_df, summary_df, preview_images, ocr_text_df, skipped_lines_df = process_delivery_files(
@@ -865,21 +699,15 @@ if process_clicked:
         )
 
         parsed_rows_export_bytes = dataframe_to_excel_bytes(
-            {
-                "Parsed_OCR_Rows": raw_df if not raw_df.empty else pd.DataFrame()
-            }
+            {"Parsed_OCR_Rows": raw_df if not raw_df.empty else pd.DataFrame()}
         )
 
         ocr_text_export_bytes = dataframe_to_excel_bytes(
-            {
-                "OCR_Raw_Text": ocr_text_df if not ocr_text_df.empty else pd.DataFrame()
-            }
+            {"OCR_Raw_Text": ocr_text_df if not ocr_text_df.empty else pd.DataFrame()}
         )
 
         skipped_lines_export_bytes = dataframe_to_excel_bytes(
-            {
-                "Skipped_Lines": skipped_lines_df if not skipped_lines_df.empty else pd.DataFrame()
-            }
+            {"Skipped_Lines": skipped_lines_df if not skipped_lines_df.empty else pd.DataFrame()}
         )
 
         updated_tracker_bytes = workbook_to_bytes(wb)
